@@ -1,0 +1,121 @@
+{
+	"name": "valgrind",
+	"displayName": "Valgrind",
+	"description": "Valgrind support and error matching",
+	"version": "0.0.1",
+	"engines": {
+		"vscode": "^1.52.0"
+	},
+	"categories": [
+		"Linters"
+	],
+	"activationEvents": [
+		"*"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"title": "Valgrind: Show diagnostics from a XML log file",
+				"command": "valgrind.load"
+			}
+		],
+		"taskDefinitions": [
+			{
+				"type": "valgrind",
+				"required": [],
+				"properties": {
+					"tool": {
+						"type": "string",
+						"description": "Valgrind tool to run",
+						"enum": [
+							"memcheck"
+						],
+						"default": "memcheck"
+					},
+					"command": {
+						"type": "string",
+						"description": "Command and args to run",
+						"default": "${workspaceFolder}/a.out"
+					},
+					"leakresolution": {
+						"type": "string",
+						"description": "Differentiation of leak stack traces",
+						"enum": [
+							"low",
+							"med",
+							"high"
+						],
+						"default": "high"
+					},
+					"showleakkinds": {
+						"type": "array",
+						"description": "Which leak kinds to show",
+						"uniqueItems": true,
+						"items": {
+							"type": "string",
+							"enum": [
+								"definite",
+								"indirect",
+								"possible",
+								"reachable",
+								"all",
+								"none"
+							]
+						},
+						"default": [
+							"definite",
+							"possible"
+						]
+					},
+					"undefvalueerrors": {
+						"type": "boolean",
+						"description": "Check for undefined value errors",
+						"default": true
+					},
+					"trackorigins": {
+						"type": "boolean",
+						"description": "Show origins of undefined values",
+						"default": true
+					},
+					"defaultsuppressions": {
+						"type": "boolean",
+						"description": "Load default suppressions",
+						"default": true
+					},
+					"stacktrace": {
+						"type": "boolean",
+						"description": "Show the full stack trace in the diagnostics",
+						"default": false
+					}
+				}
+			}
+		]
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"lint": "eslint src --ext ts",
+		"watch": "tsc -watch -p ./",
+		"pretest": "npm run compile && npm run lint",
+		"test": "node ./out/test/runTest.js"
+	},
+	"devDependencies": {
+		"@types/vscode": "^1.52.0",
+		"@types/glob": "^7.1.3",
+		"@types/mocha": "^8.0.0",
+		"@types/node": "^12.11.7",
+		"eslint": "^7.9.0",
+		"@typescript-eslint/eslint-plugin": "^4.1.1",
+		"@typescript-eslint/parser": "^4.1.1",
+		"glob": "^7.1.6",
+		"mocha": "^8.1.3",
+		"typescript": "^4.0.2",
+		"vscode-test": "^1.4.0"
+	},
+	"dependencies": {
+		"@types/tmp": "^0.2.0",
+		"fast-xml-parser": "^3.17.5",
+		"tmp-promise": "^3.0.2"
+	}
+}
