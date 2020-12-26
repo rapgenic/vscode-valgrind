@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as tmp from 'tmp-promise';
-import * as xml from 'fast-xml-parser';
+import * as xml from 'xml2js';
 import * as path from 'path';
 
 interface ValgrindTaskDefinition extends vscode.TaskDefinition {
@@ -11,7 +11,6 @@ interface ValgrindTaskDefinition extends vscode.TaskDefinition {
 	undefvalueerrors?: boolean,
 	trackorigins?: boolean,
 	defaultsuppressions?: boolean,
-	stacktrace?: boolean
 }
 
 const VALGRIND_TYPE = 'valgrind';
@@ -22,116 +21,150 @@ function fileInWorkspace(pathOrUri: string | vscode.Uri) {
 	return vscode.workspace.asRelativePath(pathOrUri, false) != pathOrUri;
 }
 
-function isIterable(obj: any) {
-	if (obj == null) {
-		return false;
-	}
-
-	return typeof obj[Symbol.iterator] === 'function';
-}
-
 function getLineRange(line: number) {
 	return new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER);
 }
 
-function parseCode(type: string) {
-	switch (type) {
-		case "InvalidFree": return "Invalid Free"
-		case "MismatchedFree": return "Mismatched Free"
-		case "InvalidRead": return "Invalid Read"
-		case "InvalidJump": return "Invalid Jump"
-		case "Overlap": return "Overlap"
-		case "InvalidMemPool": return "Invalid memory pool"
-		case "UninitCondition": return "Uninitialised jump"
-		case "UninitValue": return "Uninitialised value"
-		case "SyscallParam": return "System call parameter"
-		case "ClientCheck": return "Client check"
-		case "Leak_DefinitelyLost": return "Leak: definitely lost"
-		case "Leak_IndirectlyLost": return "Leak: indirectly lost"
-		case "Leak_PossiblyLost": return "Leak: possibly lost"
-		case "Leak_StillReachable": return "Leak: still reachable"
+function getCodeDocumentation(code: string) {
+	switch (code) {
+		case 'InvalidRead':
+		case 'InvalidWrite':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.badrw';
+		case 'UninitValue':
+		case 'UninitCondition':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.uninitvals';
+		case 'SyscallParam':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.bad-syscall-args';
+		case 'InvalidFree':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.badfrees';
+		case 'MismatchedFree':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.rudefn';
+		case 'Overlap':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.overlap';
+		case 'FishyValue':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.fishyvalue';
+		case 'Leak_DefinitelyLost':
+		case 'Leak_IndirectlyLost':
+		case 'Leak_PossiblyLost':
+		case 'Leak_StillReachable':
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.leaks';
+		default:
+			return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.errormsgs';
 	}
 }
 
-async function parseDiagnostics(pathOrUri: string | vscode.Uri, showStackTrace: boolean = true) {
+async function parseDiagnostics(pathOrUri: string | vscode.Uri) {
 	if (!(pathOrUri instanceof vscode.Uri))
 		pathOrUri = vscode.Uri.file(pathOrUri);
 
 	const log = await vscode.workspace.fs.readFile(pathOrUri);
-	const data = xml.parse(log.toString());
+	const data = await xml.parseStringPromise(log, {
+		preserveChildrenOrder: true,
+		explicitChildren: true
+	});
 
 	let unknownSymbols = 0;
 	let symbols = 0;
-	let errors = data['valgrindoutput']['error'];
+
+	// Array of all the errors
+	// TODO: include TOOLSPECIFIC and CLIENTMSG
+	let errors = data['valgrindoutput']['error'] || [];
 	let diagnostics: Record<string, vscode.Diagnostic[]> = {};
 
-	if (!isIterable(errors)) {
-		errors = [errors];
-	}
-
 	for (let error of errors) {
-		let message = 'xwhat' in error ? error['xwhat']['text'] : error['what'];
-  		let stack = error['stack']['frame'];
-		let code = error['kind'];
+		// Information message can either be in form of a simple what tag or a
+		// composite xwhat tag
+		let message;
+
+		// Error code
+		let code;
+
+		// Diagnostic stack trace output
 		let stacktrace: vscode.DiagnosticRelatedInformation[] = [];
+
+		// Temp variables to store the deepest frame of a file in the workspace
+		// to which the diagnostic will be associated
 		let lastfile: string | undefined = undefined;
 		let lastfileline: number;
 
-		if (!isIterable(stack)) {
-			stack = [stack];
+		// Temp auxmessage
+		let auxmessage: string | undefined = undefined;
+
+		for (let element of error['$$']) {
+			switch (element['#name']) {
+				case 'xwhat':
+					message = element['text'][0];
+					break;
+				case 'what':
+					message = element['_'];
+					break;
+				case 'kind':
+					code = element['_'];
+					break;
+				case 'stack':
+					// Frames of the stack
+					let frames = element['frame'];
+
+					for (let frame of frames) {
+						// Count how many symbols are referenced
+						symbols++;
+
+						let ip = frame['ip'][0];
+						// The following attributes might not be present
+						let fn = frame['fn'];
+						let dir = frame['dir'];
+						let file = frame['file'];
+						let line = frame['line'];
+
+						if (!fn || !dir || !file || !line) {
+							// Count the symbols which miss debug information
+							unknownSymbols++;
+							continue;
+						} else {
+							fn = fn[0];
+							dir = dir[0];
+							file = file[0];
+							line = line[0];
+						}
+
+						// Full path of the file
+						let fpath = path.join(dir, file)
+
+						// Only show in the stacktrace the files that belong to the
+						// workspace
+						if (fileInWorkspace(fpath)) {
+							stacktrace.push(
+								new vscode.DiagnosticRelatedInformation(
+									new vscode.Location(
+										vscode.Uri.file(fpath),
+										getLineRange(line - 1)
+									),
+									`${auxmessage ? auxmessage + ' ' : ''}at ${fn} (${ip})\n`
+								)
+							);
+
+							auxmessage = undefined;
+
+							// The first file in the workspace gets associated with the
+							// diagnostic
+							if (!lastfile) {
+								lastfile = fpath;
+								lastfileline = line;
+							}
+						}
+					}
+					break;
+				case 'auxwhat':
+					auxmessage = element['_'];
+					break;
+				case 'xauxwhat':
+					auxmessage = element['text'][0];
+					break;
+			}
 		}
 
-		for (let frame of stack) {
-			let fn = frame['fn'];
-			let dir = frame['dir'];
-			let file = frame['file'];
-			let line = frame['line'];
-
-			symbols++;
-
-			if (!dir || !file || !line) {
-				unknownSymbols++;
-				continue;
-			}
-
-			let fpath = path.join(dir, file)
-
-			if (fileInWorkspace(fpath)) {
-				if (showStackTrace) {
-					stacktrace.push(
-						new vscode.DiagnosticRelatedInformation(
-							new vscode.Location(
-								vscode.Uri.file(fpath),
-								getLineRange(line - 1)
-							),
-							`at ${fn} (${file}:${line})\n`
-						)
-					);
-				}
-
-				if (!lastfile) {
-					lastfile = fpath;
-					lastfileline = line;
-				}
-			}
-		}
-
-		if (!lastfile) {
-			let frame = stack[0];
-			let dir = frame['dir'];
-			let file = frame['file'];
-			let line = frame['line'];
-
-			if (dir && file && line) {
-				let fpath = path.join(dir, file)
-
-				if (fileInWorkspace(fpath)) {
-					lastfile = fpath;
-					lastfileline = line;
-				}
-			}
-		}
-
+		// Skip the diagnostic if it cannot be associated to a file in the
+		// workspace
 		if (lastfile) {
 			if (!(lastfile in diagnostics)) {
 				diagnostics[lastfile] = [];
@@ -140,7 +173,10 @@ async function parseDiagnostics(pathOrUri: string | vscode.Uri, showStackTrace: 
 			let diagnostic = new vscode.Diagnostic(getLineRange(lastfileline! - 1), `${message}`);
 
 			diagnostic.source = VALGRIND_TYPE;
-			diagnostic.code = code;
+			diagnostic.code = {
+				value: code,
+				target: vscode.Uri.parse(getCodeDocumentation(code))
+			};
 			diagnostic.relatedInformation = stacktrace;
 
 			diagnostics[lastfile].push(diagnostic);
@@ -199,9 +235,8 @@ export async function activate(context: vscode.ExtensionContext) {
 		if (event.execution.task.definition.type == VALGRIND_TYPE) {
 			// Extract logfile from command line
 			const logfile = (<vscode.ShellExecution>event.execution.task.execution)?.args.filter((value) => value.toString().startsWith('--xml-file='))[0].toString().substr(11);
-			const definition: ValgrindTaskDefinition = <any>event.execution.task.definition;
 
-			await parseDiagnostics(logfile, definition.stacktrace);
+			await parseDiagnostics(logfile);
 		}
 	}));
 
