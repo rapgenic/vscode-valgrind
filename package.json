@@ -1,5 +1,5 @@
 {
-	"name": "valgrind",
+	"name": "vscode-valgrind",
 	"displayName": "Valgrind",
 	"description": "Valgrind support and error matching",
 	"version": "0.0.1",
@@ -20,6 +20,16 @@
 				"command": "valgrind.load"
 			}
 		],
+		"configuration": {
+			"title": "Valgrind",
+			"properties": {
+				"valgrind.compactLeakReport": {
+					"type": "boolean",
+					"default": false,
+					"description": "For each leaking line of code compact multiple leak reports into a single one (enhances readability, decreases detail)"
+				}
+			}
+		},
 		"taskDefinitions": [
 			{
 				"type": "valgrind",
