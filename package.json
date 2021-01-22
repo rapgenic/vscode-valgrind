@@ -18,6 +18,10 @@
 			{
 				"title": "Valgrind: Show diagnostics from a XML log file",
 				"command": "valgrind.load"
+			},
+			{
+				"title": "LeakSanitizer: Show diagnostics from a log file",
+				"command": "leaksanitizer.load"
 			}
 		],
 		"configuration": {

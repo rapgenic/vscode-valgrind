@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import * as tmp from 'tmp-promise';
-import * as xml from 'xml2js';
-import * as path from 'path';
+import { Tools } from './tools';
 
 interface ValgrindTaskDefinition extends vscode.TaskDefinition {
 	tool?: string,
@@ -13,265 +12,8 @@ interface ValgrindTaskDefinition extends vscode.TaskDefinition {
 	defaultsuppressions?: boolean,
 };
 
-class ValgrindDiagnostic extends vscode.Diagnostic {
-	public bytesLeaked?: number
-	public records?: number
-
-	constructor(line: number, message: string) {
-		super(getLineRange(line), message);
-	};
-
-	get kind() {
-		return (<{ value: string }>this.code).value
-	}
-
-	set kind(code: string) {
-		this.code = {
-			value: code,
-			target: vscode.Uri.parse(ValgrindDiagnostic.getCodeDocumentation(code))
-		}
-	}
-
-	public getLine() {
-		return this.range.start.line + 1;
-	}
-
-	public fillCompactLeakMessage() {
-		if (!this.kind.startsWith('Leak_'))
-			throw new Error('Must be a leak report')
-
-		let how;
-
-		switch (this.kind) {
-			case 'Leak_DefinitelyLost':
-				how = 'definitely lost';
-				break;
-			case 'Leak_IndirectlyLost':
-				how = 'indirectly lost';
-				break;
-			case 'Leak_PossiblyLost':
-				how = 'possibly lost';
-				break;
-			case 'Leak_StillReachable':
-				how = 'still reachable';
-				break;
-		}
-
-		this.message = `${this.bytesLeaked} bytes are ${how} in ${this.records} records (compact)`;
-	}
-
-	static getCodeDocumentation(code: string) {
-		switch (code) {
-			case 'InvalidRead':
-			case 'InvalidWrite':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.badrw';
-			case 'UninitValue':
-			case 'UninitCondition':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.uninitvals';
-			case 'SyscallParam':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.bad-syscall-args';
-			case 'InvalidFree':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.badfrees';
-			case 'MismatchedFree':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.rudefn';
-			case 'Overlap':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.overlap';
-			case 'FishyValue':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.fishyvalue';
-			case 'Leak_DefinitelyLost':
-			case 'Leak_IndirectlyLost':
-			case 'Leak_PossiblyLost':
-			case 'Leak_StillReachable':
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.leaks';
-			default:
-				return 'https://www.valgrind.org/docs/manual/mc-manual.html#mc-manual.errormsgs';
-		}
-	}
-};
-
 const VALGRIND_TYPE = 'valgrind';
-
-let diagnosticsCollection = vscode.languages.createDiagnosticCollection('valgrind');
-
-function fileInWorkspace(pathOrUri: string | vscode.Uri) {
-	return vscode.workspace.asRelativePath(pathOrUri, false) != pathOrUri;
-}
-
-function getLineRange(line: number) {
-	return new vscode.Range(line - 1, 0, line - 1, Number.MAX_SAFE_INTEGER);
-}
-
-async function parseDiagnostics(pathOrUri: string | vscode.Uri) {
-	if (!(pathOrUri instanceof vscode.Uri))
-		pathOrUri = vscode.Uri.file(pathOrUri);
-
-	const log = await vscode.workspace.fs.readFile(pathOrUri);
-	const data = await xml.parseStringPromise(log, {
-		preserveChildrenOrder: true,
-		explicitChildren: true
-	});
-	const compactleaks = vscode.workspace.getConfiguration('valgrind').get('compactLeakReport', false);
-
-	let unknownSymbols = 0;
-	let symbols = 0;
-
-	// Array of all the errors
-	// TODO: include TOOLSPECIFIC and CLIENTMSG
-	let errors = data['valgrindoutput']['error'] || [];
-	let diagnostics: Record<string, ValgrindDiagnostic[]> = {};
-
-	for (let error of errors) {
-		// Information message can either be in form of a simple what tag or a
-		// composite xwhat tag
-		let message;
-
-		// Error code
-		let kind: string;
-
-		// Diagnostic stack trace output
-		let stacktrace: vscode.DiagnosticRelatedInformation[] = [];
-
-		// Temp variables to store the deepest frame of a file in the workspace
-		// to which the diagnostic will be associated
-		let lastfile: string | undefined = undefined;
-		let lastfileline: number | undefined = undefined;
-
-		// Misc temp variables
-		let auxmessage: string | undefined = undefined;
-		let bytesleaked: number | undefined = undefined;
-
-		for (let element of error['$$']) {
-			switch (element['#name']) {
-				case 'xwhat':
-					message = element['text'][0];
-
-					if ('leakedbytes' in element)
-						bytesleaked = Number.parseInt(element['leakedbytes'][0]);
-					break;
-				case 'what':
-					message = element['_'];
-					break;
-				case 'kind':
-					kind = element['_'];
-					break;
-				case 'stack':
-					// Frames of the stack
-					let frames = element['frame'];
-
-					for (let frame of frames) {
-						// Count how many symbols are referenced
-						symbols++;
-
-						let ip = frame['ip'][0];
-						// The following attributes might not be present
-						let fn = frame['fn'];
-						let dir = frame['dir'];
-						let file = frame['file'];
-						let line = frame['line'];
-
-						if (!fn || !dir || !file || !line) {
-							// Count the symbols which miss debug information
-							unknownSymbols++;
-							continue;
-						} else {
-							fn = fn[0];
-							dir = dir[0];
-							file = file[0];
-							line = line[0];
-						}
-
-						// Full path of the file
-						let fpath = path.join(dir, file)
-
-						// Only show in the stacktrace the files that belong to the
-						// workspace
-						if (fileInWorkspace(fpath)) {
-							stacktrace.push(
-								new vscode.DiagnosticRelatedInformation(
-									new vscode.Location(
-										vscode.Uri.file(fpath),
-										getLineRange(line)
-									),
-									`${auxmessage ? auxmessage + ' ' : ''}at ${fn}() (${ip})\n`
-								)
-							);
-
-							auxmessage = undefined;
-
-							// The first file in the workspace gets associated with the
-							// diagnostic
-							if (!lastfile) {
-								lastfile = fpath;
-								lastfileline = line;
-							}
-						}
-					}
-					break;
-				case 'auxwhat':
-					auxmessage = element['_'];
-					break;
-				case 'xauxwhat':
-					auxmessage = element['text'][0];
-					break;
-			}
-		}
-
-		// Skip the diagnostic if it cannot be associated to a file in the
-		// workspace
-		if (lastfile) {
-			let add = true;
-
-			if (!(lastfile in diagnostics)) {
-				diagnostics[lastfile] = [];
-			}
-
-			// In compact leak mode we reuse the diagnostic with the same code
-			// at the same line for every leak
-			if (compactleaks && bytesleaked) {
-				let previousleakmessages = diagnostics[lastfile].filter(
-					d => d.kind == kind && d.getLine() == lastfileline
-				);
-
-				if (previousleakmessages.length) {
-					previousleakmessages[0].bytesLeaked! += bytesleaked;
-					previousleakmessages[0].records!++;
-					previousleakmessages[0].fillCompactLeakMessage();
-
-					add = false;
-				}
-			}
-
-			if (add) {
-				let diagnostic = new ValgrindDiagnostic(lastfileline!, message);
-
-				diagnostics[lastfile].push(diagnostic);
-
-				diagnostic.source = VALGRIND_TYPE;
-				diagnostic.kind = kind!
-				diagnostic.relatedInformation = stacktrace;
-
-				if (bytesleaked) {
-					diagnostic.records = 1;
-					diagnostic.bytesLeaked = bytesleaked;
-
-					if (compactleaks) {
-						diagnostic.fillCompactLeakMessage();
-						// In compact leak mode the stack trace is useless
-						diagnostic.relatedInformation = undefined;
-					}
-				}
-			}
-		}
-	}
-
-	diagnosticsCollection.clear();
-
-	for (let file in diagnostics) {
-		diagnosticsCollection.set(vscode.Uri.file(file), diagnostics[file]);
-	}
-
-	console.log(`Unknown symbols ratio: ${unknownSymbols / symbols}`)
-}
+const tools = new Tools();
 
 export async function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.tasks.registerTaskProvider(VALGRIND_TYPE, {
@@ -317,7 +59,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			// Extract logfile from command line
 			const logfile = (<vscode.ShellExecution>event.execution.task.execution)?.args.filter((value) => value.toString().startsWith('--xml-file='))[0].toString().substr(11);
 
-			await parseDiagnostics(logfile);
+			await tools.parse('valgrind', logfile);
 		}
 	}));
 
@@ -330,10 +72,18 @@ export async function activate(context: vscode.ExtensionContext) {
 		});
 
 		if (logfile)
-			await parseDiagnostics(logfile[0]);
+			await tools.parse('valgrind', logfile[0]);
+	}));
+
+	context.subscriptions.push(vscode.commands.registerCommand('leaksanitizer.load', async () => {
+		let logfile = await vscode.window.showOpenDialog({
+			title: "Load a LeakSanitizer log file"
+		});
+
+		if (logfile)
+			await tools.parse('leaksanitizer', logfile[0]);
 	}));
 }
 
 export function deactivate() {
-	diagnosticsCollection.dispose()
 }
